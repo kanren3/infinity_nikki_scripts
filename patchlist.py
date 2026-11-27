@@ -12,6 +12,7 @@ params = {
     "app_id": "5510010",
     "channel": "3",
     "clientid": "1106",
+    "env": "prod",
     "region": "1",
     "sign_type": "hmac",
     "timestamp": str(int(time.time())),
@@ -46,3 +47,13 @@ urls = result["data"]["game_config_patch"]["extra"]["cdn_url"].split(";")
 print("主地址：", urls[0])
 if len(urls) > 1:
     print("备用地址：", urls[1])
+
+manifest_url = result["data"]["game_config_apk"]["diff_file_download_address"]
+with urllib.request.urlopen(manifest_url, timeout=20) as response:
+    manifest = json.load(response)
+
+package = manifest["latest"]
+print("本体清单：", manifest_url)
+print("本体版本：", package["version"])
+print("本体地址：", package["url"])
+print("本体 MD5：", package["md5"])

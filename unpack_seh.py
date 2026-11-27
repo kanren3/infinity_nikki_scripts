@@ -26,6 +26,8 @@ class Win64Seh:
         self.workspace = None
         self.handler_stack = None
         self.count = 0
+        self.vectored = []
+        self.next_vectored_handle = 1
 
     def capture(self):
         context = {name: self.m.uc.reg_read(getattr(x86, 'UC_X86_REG_' + name))
@@ -40,6 +42,8 @@ class Win64Seh:
         struct.pack_into('<H', data, 0x38, 0x33)
         struct.pack_into('<H', data, 0x42, 0x2b)
         struct.pack_into('<I', data, 0x44, context['EFLAGS'])
+        debug = self.m.api.thread_debug_registers.get(self.m.current_thread, (0,) * 6)
+        struct.pack_into('<6Q', data, 0x48, *debug)
         for name, offset in zip(REGISTERS, CONTEXT_OFFSETS):
             struct.pack_into('<Q', data, offset, context[name])
         struct.pack_into('<Q', data, 0xf8, context['RIP'])
@@ -54,6 +58,8 @@ class Win64Seh:
             result[name] = struct.unpack_from('<Q', data, offset)[0]
         result['RIP'] = struct.unpack_from('<Q', data, 0xf8)[0]
         result['EFLAGS'] = struct.unpack_from('<I', data, 0x44)[0]
+        for i in range(16):
+            result[f'XMM{i}'] = int.from_bytes(data[0x1a0 + i * 16:0x1b0 + i * 16], 'little')
         return result
 
     def restore(self, context):
@@ -128,7 +134,7 @@ class Win64Seh:
                 a, b, c = struct.unpack('<III', self.m.read(trailer, 12))
                 entry = (a, b, c, trailer)
                 continue
-            if flags & 3:
+            if flags & 1 and original_pc - module.base - start >= prolog:
                 handler = module.base + int.from_bytes(self.m.read(trailer, 4), 'little')
                 handler_data = trailer + 4
             work['RIP'] = self.m.u64(work['RSP'])
@@ -163,11 +169,12 @@ class Win64Seh:
             machine.uc.context_restore(saved)
             machine.error = old_error
 
-    def dispatch(self, code, access, address, deadline):
+    def dispatch(self, code, access, address, deadline, *, vectored_only=False):
         machine = self.m
-        self.count += 1
-        if self.count > 64:
-            raise RuntimeError('SEH exception count limit exceeded')
+        if not vectored_only:
+            self.count += 1
+            if self.count > 4096:
+                raise RuntimeError('SEH exception count limit exceeded')
         if self.workspace is None:
             self.workspace = machine.alloc(0x3000)
         exception = self.workspace
@@ -184,6 +191,16 @@ class Win64Seh:
         struct.pack_into('<QQ', record, 0x20, access, address)
         machine.write(exception, bytes(record))
         machine.write(pointers, struct.pack('<QQ', exception, original_ptr))
+        for _, handler in tuple(self.vectored):
+            disposition = self.invoke(handler, (pointers,), deadline)
+            if disposition == 0xffffffff:
+                self.restore(self.load_context(original_ptr, original))
+                machine.error = None
+                return True
+            if disposition != 0:
+                raise RuntimeError(f'VEH: invalid handler disposition {disposition:#x}')
+        if vectored_only:
+            return False
         walk = dict(original)
         for _ in range(64):
             module, entry = self.runtime_function(walk['RIP'])
@@ -229,7 +246,7 @@ class Win64Seh:
                     self.save_context(walk_ptr, work)
                     machine.write(dispatcher, struct.pack('<QQQQQQQQII', before['RIP'], module.base,
                                   entry[3], frame, 0, walk_ptr, handler, data, 0, 0))
-                    result = self.invoke(handler, (exception, frame, walk_ptr, dispatcher), deadline)
+                    result = self.invoke(handler, (exception, frame, original_ptr, dispatcher), deadline)
                     work = self.load_context(walk_ptr, work)
                     if result == 0:  # ExceptionContinueExecution
                         self.restore(self.load_context(original_ptr, original))

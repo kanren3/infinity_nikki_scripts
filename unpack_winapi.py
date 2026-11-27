@@ -6,10 +6,12 @@ clock. Module lookup and bounded emulated memory are supplied by the machine.
 Unsupported operations stop emulation instead of claiming to have succeeded.
 """
 
+import ctypes
 import json
 from pathlib import Path, PureWindowsPath
 import struct
 import unicodedata
+import pefile
 from unicorn import UcError
 
 
@@ -78,6 +80,8 @@ class Win64Api:
         self.next_atom = 0xc000
         self.timer_handles = {}
         self.token_handles = {}
+        self.enabled_privileges = set()
+        self.process_handles = {}
         self.critical = set()
         self.srw = {}
         self.mutex_handles = {}
@@ -190,12 +194,40 @@ class Win64Api:
         for offset in range(0, count, 65536):
             self.m.write(addr + offset, zeros[:min(65536, count - offset)])
 
+    def _probe(self, address, size, writable=False):
+        if size == 0:
+            return True
+        if address < 0x10000 or address + size > 0x7fffffff0000:
+            return False
+        end = address + size
+        required = 2 if writable else 1
+        for lo, hi, mode in sorted(self.m.uc.mem_regions()):
+            if hi < address:
+                continue
+            if lo > address or not mode & required:
+                return False
+            address = hi + 1
+            if address >= end:
+                return True
+        return False
+
+    def _process(self, handle):
+        return handle == MASK64 or handle in self.process_handles
+
     def _protect(self, addr, size, protection):
         if protection not in PROTECTION:
             return STATUS_INVALID_PAGE_PROTECTION, 0
         if not addr or not size or addr + size > MASK64:
             return STATUS_INVALID_PARAMETER, 0
         first, end = addr & -PAGE, page_up(addr + size)
+        # Mapped section views remain backed even after their handles are closed.
+        if any(base <= first and end <= base + page_up(size) for base, (_, size) in self.file_views.items()):
+            old = self.protections.get(first)
+            if old is not None:
+                self.m.uc.mem_protect(first, end - first, PROTECTION[protection])
+                for page in range(first, end, PAGE):
+                    self.protections[page] = protection
+                return 0, old
         cur, old = first, 0
         for lo, hi, perms in sorted(self.m.uc.mem_regions()):
             if hi < cur:
@@ -216,7 +248,7 @@ class Win64Api:
 
     def _virtual(self, kind, a):
         m = self.m
-        if a(0) != MASK64:
+        if not self._process(a(0)):
             return STATUS_INVALID_HANDLE
         bp = a(1)
         sp = a(3 if kind == 'Allocate' else 2)
@@ -235,6 +267,8 @@ class Win64Api:
             m.put32(a(4), old)
         elif kind == 'Allocate':
             flags, prot = a(4) & MASK32, a(5) & MASK32
+            top_down = bool(flags & 0x100000)
+            flags &= ~0x100000
             if not size or flags not in (0x1000, 0x2000, 0x3000):
                 return STATUS_INVALID_PARAMETER
             if prot not in PROTECTION:
@@ -242,10 +276,17 @@ class Win64Api:
             if a(2):
                 raise RuntimeError('NtAllocateVirtualMemory: nonzero ZeroBits not modeled')
             if addr:
-                if flags != 0x1000 or not any(lo <= base and end <= lo + n for lo, n in self.virtual_blocks.items()):
-                    raise RuntimeError('NtAllocateVirtualMemory: placement outside existing reservation')
+                if flags & 0x2000:
+                    base = addr & -0x10000
+                    if any(lo < end and hi + 1 > base for lo, hi, _ in m.uc.mem_regions()):
+                        return 0xc0000018  # STATUS_CONFLICTING_ADDRESSES
+                    m.map_region(base, end - base)
+                    m.allocations[base] = (end - base, end - base)
+                    self.virtual_blocks[base] = end - base
+                elif not any(lo <= base and end <= lo + n for lo, n in self.virtual_blocks.items()):
+                    return 0xc0000018
             else:
-                base = m.alloc(size)
+                base = m.alloc_top_down(size) if top_down else m.alloc(size)
                 if not base:
                     return STATUS_NO_MEMORY
                 end = base + page_up(size)
@@ -404,7 +445,9 @@ class Win64Api:
             if callback and value:
                 raise RuntimeError('FlsFree: non-null guest destructor needs execution')
             if tls:
-                self.m.put64(self._tls_address(i), 0)
+                address = self._tls_address(i)
+                if address:
+                    self.m.put64(address, 0)
             del slots[i]
             for key in [key for key in self.fls_values if key[1] == i]:
                 del self.fls_values[key]
@@ -418,7 +461,7 @@ class Win64Api:
             if not tls:
                 self.fls_values[tid, i] = a(1)
             if tls:
-                self.m.put64(self._tls_address(i), a(1))
+                self.m.put64(self._tls_address(i, create=True), a(1))
         return 1
 
     def _critical(self, name, a):
@@ -593,6 +636,133 @@ class Win64Api:
             return self._error(126)
         return module.base
 
+    def _map_section(self, section, offset, size, protection, address=0):
+        m = self.m
+        mapped = page_up(size)
+        if address:
+            if address & 0xffff or any(lo < address + mapped and hi >= address for lo, hi, _ in m.uc.mem_regions()):
+                return 0
+            m.map_region(address, mapped)
+            m.allocations[address] = (size, mapped)
+        else:
+            address = m.alloc(size)
+        m.uc.mem_unmap(address, mapped)
+        m.uc.mem_map_ptr(address, mapped, PROTECTION[protection],
+                         ctypes.addressof(section['buffer']) + offset)
+        self.file_views[address] = (section, size)
+        for page in range(address, address + mapped, PAGE):
+            self.protections[page] = protection
+        return address
+
+    def coalesce_section_view(self, address):
+        """Merge Unicorn region metadata without changing backing bytes or permissions."""
+        section, size = self.file_views[address]
+        if size != section['size']:
+            raise RuntimeError('Region coalescing requires a whole-section view')
+        end = address + page_up(size)
+        groups = []
+        for lo, hi, mode in sorted(self.m.uc.mem_regions()):
+            if lo < address or hi >= end:
+                continue
+            if groups and groups[-1][1] + 1 == lo and groups[-1][2] == mode:
+                groups[-1][1] = hi
+                groups[-1][3] += 1
+            else:
+                groups.append([lo, hi, mode, 1])
+        for lo, hi, mode, count in groups:
+            if count < 2:
+                continue
+            self.m.uc.ctl_remove_cache(lo, hi + 1)
+            self.m.uc.mem_unmap(lo, hi - lo + 1)
+            self.m.uc.mem_map_ptr(lo, hi - lo + 1, mode,
+                                 ctypes.addressof(section['buffer']) + lo - address)
+
+    def _mapping(self, name, a):
+        m = self.m
+        if name == 'UnmapViewOfFile':
+            view = self.file_views.get(a(0))
+            if view is None:
+                return self._error(487)
+            m.free(a(0))
+            del self.file_views[a(0)]
+            return 1
+        if name == 'MapViewOfFile':
+            handle = self.mapping_handles.get(a(0))
+            if handle is None:
+                return self._error(6)
+            section, allowed = handle
+            access = a(1) & MASK32
+            if access not in (2, 4, 6, 0xf001f):
+                raise RuntimeError(f'MapViewOfFile: access not modeled: {access:#x}')
+            writable = bool(access & 2)
+            if (writable and (section['protection'] != 4 or not allowed & 2)) or not allowed & 4:
+                return self._error(5)
+            offset = ((a(2) & MASK32) << 32) | (a(3) & MASK32)
+            size = a(4) or section['size'] - offset
+            if offset & 0xffff or size <= 0 or offset + size > section['size']:
+                return self._error(87)
+            return self._map_section(section, offset, size, 4 if writable else 2)
+        opening = name.startswith('Open')
+        key_ptr = a(2) if opening else a(5)
+        key = m.cstr(key_ptr, wide=name.endswith('W')) if key_ptr else None
+        existing = next((section for section, _ in (*self.mapping_handles.values(), *self.file_views.values())
+                         if key is not None and section['name'] == key), None)
+        if opening:
+            access = a(0) & MASK32
+            if access not in (2, 4, 6, 0xf001f):
+                raise RuntimeError(f'{name}: access not modeled: {access:#x}')
+            if existing is None:
+                return self._error(2)
+            if access & 2 and existing['protection'] != 4:
+                return self._error(5)
+            section = existing
+            access |= 4  # FILE_MAP_WRITE also permits reads.
+        else:
+            if a(1):
+                raise RuntimeError(f'{name}: security attributes not modeled')
+            protection = a(2) & MASK32
+            if protection not in (2, 4):
+                raise RuntimeError(f'{name}: protection not modeled: {protection:#x}')
+            access = 6 if protection == 4 else 4
+            if existing is not None:
+                section = existing
+                m.set_last_error(183)
+            else:
+                data = b''
+                if a(0) != MASK64:
+                    file = self.file_handles.get(a(0))
+                    if file is None:
+                        return self._error(6)
+                    if protection != 2:
+                        raise RuntimeError(f'{name}: writable file-backed mappings not modeled')
+                    data = file[0]
+                size = ((a(3) & MASK32) << 32) | (a(4) & MASK32)
+                size = size or len(data)
+                if not size or (data and size > len(data)):
+                    return self._error(87)
+                if page_up(size) > m.memory_limit:
+                    return self._error(8)
+                backing = ctypes.create_string_buffer(page_up(size))
+                if data:
+                    backing[:size] = data[:size]
+                section = {'name': key, 'size': size, 'protection': protection, 'buffer': backing}
+                m.set_last_error(0)
+        handle = self.next_handle
+        self.next_handle += 4
+        self.mapping_handles[handle] = (section, access)
+        return handle
+
+    def _input_path(self, text):
+        """Resolve only read-only inputs below the package and exported System32."""
+        text = text.removeprefix('\\??\\').removeprefix('\\\\?\\')
+        path = Path(text)
+        if not path.is_absolute():
+            path = self.m.target_path.parent / path
+        path = path.resolve()
+        if not any(path.is_relative_to(root) for root in (self.m.target_path.parent, self.m.system_dir)):
+            raise PermissionError(f'Guest file access outside input roots: {text!r}')
+        return path
+
     def _file(self, name, a):
         m = self.m
         if name in ('CreateFileW', 'CreateFileA'):
@@ -614,15 +784,17 @@ class Win64Api:
                 writable = bool(access & 0x40000000)
             else:
                 if access != 0x80000000 or disposition != 3:
-                    raise RuntimeError(f'{name}: only approved PE inputs may be read outside guest temp')
-                leaf = PureWindowsPath(text).name
-                module = next((item for item in m.modules if item.name == leaf), None)
-                if module is None:
-                    local = m.target_path.parent / leaf
-                    if not local.is_file():
-                        return self._error(2, MASK64)
-                    raise RuntimeError(f'{name}: existing file not in approved mapped PE inputs: {text}')
-                data, writable = module.pe.__data__, False
+                    raise RuntimeError(f'{name}: only read-only input files may be opened outside guest temp')
+                try:
+                    path = self._input_path(text)
+                except PermissionError:
+                    return self._error(5, MASK64)
+                if not path.is_file():
+                    return self._error(2 if path.parent.is_dir() else 3, MASK64)
+                module = next((item for item in m.modules if item.path == path), None)
+                if path.stat().st_size > m.memory_limit:
+                    return self._error(8, MASK64)
+                data, writable = module.pe.__data__ if module else path.read_bytes(), False
             h = self.next_handle
             self.next_handle += 4
             self.file_handles[h] = [data, 0, writable]
@@ -638,24 +810,6 @@ class Win64Api:
             if not (m.target_path.parent / text.parent.name).is_dir():
                 return self._error(3, MASK64)
             raise RuntimeError(f'FindFirstFileW: directory enumeration not modeled: {text}')
-        if name == 'UnmapViewOfFile':
-            if a(0) not in self.file_views:
-                return self._error(487)
-            del self.file_views[a(0)]
-            return int(m.free(a(0)))
-        if name == 'MapViewOfFile':
-            data = self.mapping_handles.get(a(0))
-            if data is None:
-                return self._error(6)
-            require_flags(a(1) & MASK32, 4, name)
-            offset = ((a(2) & MASK32) << 32) | (a(3) & MASK32)
-            size = a(4) or len(data) - offset
-            if size <= 0 or offset + size > len(data):
-                return self._error(87)
-            ptr = m.alloc(size)
-            m.write(ptr, data[offset:offset + size])
-            self.file_views[ptr] = size
-            return ptr
         handle = a(0)
         if name == 'CloseHandle':
             if self.file_handles.pop(handle, None) is not None:
@@ -665,13 +819,6 @@ class Win64Api:
             return self._error(6, MASK32 if name in ('GetFileSize', 'SetFilePointer') else 0)
         state = self.file_handles[handle]
         data, pos, writable = state
-        if name == 'CreateFileMappingW':
-            if (a(2) & MASK32) != 2 or a(3) or a(4) or a(5):
-                raise RuntimeError('CreateFileMappingW: only unnamed read-only whole-file mappings')
-            h = self.next_handle
-            self.next_handle += 4
-            self.mapping_handles[h] = data
-            return h
         if name in ('GetFileSize', 'GetFileSizeEx'):
             if name.endswith('Ex'):
                 m.put64(a(1), len(data))
@@ -728,23 +875,76 @@ class Win64Api:
             return 1
         return None
 
-    def _version_resource(self, path):
-        leaf = PureWindowsPath(path).name.lower()
-        module = next((item for item in self.m.modules if item.name == leaf), None)
-        if module is None:
+    def _version_resource(self, text):
+        try:
+            path = self._input_path(text)
+        except PermissionError:
             return None
-        pe = module.pe
-        if not hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE'):
-            pe.parse_data_directories(directories=[2])
-        for entry in getattr(getattr(pe, 'DIRECTORY_ENTRY_RESOURCE', None), 'entries', []):
-            if entry.id == 16:
-                item = entry.directory.entries[0].directory.entries[0].data.struct
-                return pe.get_data(item.OffsetToData, item.Size)
-        return None
+        if not path.is_file():
+            return None
+        module = next((item for item in self.m.modules if item.path == path), None)
+        pe = module.pe if module else pefile.PE(str(path), fast_load=True)
+        try:
+            if not hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE'):
+                pe.parse_data_directories(directories=[2])
+            for entry in getattr(getattr(pe, 'DIRECTORY_ENTRY_RESOURCE', None), 'entries', []):
+                if entry.id == 16:
+                    item = entry.directory.entries[0].directory.entries[0].data.struct
+                    return pe.get_data(item.OffsetToData, item.Size)
+            return None
+        finally:
+            if module is None:
+                pe.close()
 
     def dispatch(self, name, args):
         """Return the guest API result, or None if this export is not modeled."""
         m, a = self.m, args
+        if name in ('RtlAddVectoredExceptionHandler', 'AddVectoredExceptionHandler'):
+            if not self._probe(a(1), 1):
+                return 0
+            handle = m.seh.next_vectored_handle
+            m.seh.next_vectored_handle += 1
+            item = (handle, a(1))
+            if a(0):
+                m.seh.vectored.insert(0, item)
+            else:
+                m.seh.vectored.append(item)
+            return handle
+        if name in ('RtlRemoveVectoredExceptionHandler', 'RemoveVectoredExceptionHandler'):
+            for index, (handle, _) in enumerate(m.seh.vectored):
+                if handle == a(0):
+                    del m.seh.vectored[index]
+                    return 1
+            return 0
+        if name in ('CreateProcessW', 'CreateProcessA'):
+            wide = name.endswith('W')
+            application = m.cstr(a(0), wide=wide) if a(0) else ''
+            command = m.cstr(a(1), wide=wide).lstrip() if a(1) else ''
+            if not application:
+                if command.startswith('"') and '"' in command[1:]:
+                    application = command.split('"', 2)[1]
+                else:
+                    raise RuntimeError(f'{name}: unquoted executable search not modeled: {command!r}')
+            path = Path(application)
+            if not path.is_absolute():
+                raise RuntimeError(f'{name}: relative executable search not modeled: {application!r}')
+            if not path.is_file():
+                return self._error(2 if path.parent.is_dir() else 3)
+            raise RuntimeError(f'{name}: guest child process requires emulation: {application!r}; host execution forbidden')
+        if name in ('PathFindFileNameW', 'PathFindFileNameA'):
+            wide = name.endswith('W')
+            text = m.cstr(a(0), wide=wide)
+            index = max(text.rfind('\\'), text.rfind('/'), text.rfind(':')) + 1
+            return a(0) + len(text[:index].encode('utf-16-le' if wide else 'utf-8'))
+        if name == 'IsWindowVisible':
+            return self._error(1400)  # ERROR_INVALID_WINDOW_HANDLE; guest has no HWNDs.
+        if name in ('FindWindowExA', 'FindWindowExW', 'FindWindowA', 'FindWindowW'):
+            return 0  # No windows have been created in the isolated guest desktop.
+        if name == 'ShellExecuteExW':
+            info = a(0)
+            verb = m.cstr(m.u64(info + 0x10), wide=True) if m.u64(info + 0x10) else ''
+            target = m.cstr(m.u64(info + 0x18), wide=True) if m.u64(info + 0x18) else ''
+            raise RuntimeError(f'Guest requested ShellExecuteExW verb={verb!r}, target={target!r}; host execution forbidden')
         if name in ('ZwTerminateProcess', 'NtTerminateProcess', 'ExitProcess'):
             status = (a(0) if name == 'ExitProcess' else a(1)) & MASK32
             raise RuntimeError(f'Guest requested process termination with status {status:#x}')
@@ -804,17 +1004,26 @@ class Win64Api:
                         del self.atoms[key]
                     return 0
             return self._error(6, a(0))
+        if name in ('FlushInstructionCache', 'NtFlushInstructionCache', 'ZwFlushInstructionCache'):
+            if not self._process(a(0)):
+                return self._error(6) if name == 'FlushInstructionCache' else STATUS_INVALID_HANDLE
+            if a(1) and a(2):
+                m.uc.ctl_remove_cache(a(1), a(1) + a(2))
+            else:
+                m.uc.ctl_flush_tb()
+            return 1 if name == 'FlushInstructionCache' else 0
         if name == 'CreateToolhelp32Snapshot':
-            if a(0) & MASK32 != 2 or a(1):
-                raise RuntimeError('CreateToolhelp32Snapshot: only guest process enumeration modeled')
+            if a(0) & MASK32 not in (2, 4) or a(1):
+                raise RuntimeError('CreateToolhelp32Snapshot: only guest process/thread enumeration modeled')
             handle = self.next_handle
             self.next_handle += 4
-            self.snapshots[handle] = False
+            self.snapshots[handle] = {'kind': a(0) & MASK32, 'index': 0,
+                                      'threads': [tid for tid, thread in m.threads.items() if thread['exit'] is None]}
             return handle
         if name in ('Process32FirstW', 'Process32NextW', 'Process32First', 'Process32Next'):
             if a(0) not in self.snapshots:
                 return self._error(6)
-            if 'Next' in name and self.snapshots[a(0)]:
+            if 'Next' in name and self.snapshots[a(0)]['index']:
                 return self._error(18)
             wide = name.endswith('W')
             size = 568 if wide else 304
@@ -826,7 +1035,21 @@ class Win64Api:
             filename = m.target_path.name.encode('utf-16-le' if wide else 'cp1252')
             data[44:44 + len(filename)] = filename
             m.write(a(1), bytes(data))
-            self.snapshots[a(0)] = True
+            self.snapshots[a(0)]['index'] = 1
+            return 1
+        if name in ('Thread32First', 'Thread32Next'):
+            snapshot = self.snapshots.get(a(0))
+            if snapshot is None or snapshot['kind'] != 4:
+                return self._error(6)
+            if name == 'Thread32First':
+                snapshot['index'] = 0
+            index = snapshot['index']
+            if index >= len(snapshot['threads']):
+                return self._error(18)
+            if int.from_bytes(m.read(a(1), 4), 'little') < 28:
+                return self._error(24)
+            m.write(a(1), struct.pack('<IIIIiiI', 28, 0, snapshot['threads'][index], self._id(), 8, 0, 0))
+            snapshot['index'] += 1
             return 1
         if name == 'CloseHandle' and a(0) in self.snapshots:
             del self.snapshots[a(0)]
@@ -949,11 +1172,10 @@ class Win64Api:
             m.put32(a(3), length)
             return 1
         if name == 'GetFileAttributesW':
-            text = PureWindowsPath(m.cstr(a(0), wide=True))
-            module = next((item for item in m.modules if item.name == text.name.lower()), None)
-            if module is not None:
-                return 0x20
-            local = m.target_path.parent / text.name
+            try:
+                local = self._input_path(m.cstr(a(0), wide=True))
+            except PermissionError:
+                return self._error(5, MASK32)
             if local.is_dir():
                 return 0x10
             if local.is_file():
@@ -970,7 +1192,7 @@ class Win64Api:
             m.put64(a(2), identifiers[privilege])
             return 1
         if name == 'OpenProcessToken':
-            if a(0) != MASK64:
+            if not self._process(a(0)):
                 return self._error(6)
             handle = self.next_handle
             self.next_handle += 4
@@ -982,7 +1204,8 @@ class Win64Api:
             if access is None or not access & 8:
                 return self._error(6 if access is None else 5)
             kind = a(1) & MASK32
-            values = {8: 1, 18: 1, 20: 0, 21: 0, 24: 0, 26: 0}
+            values = {8: 1, 18: 2 if m.guest_elevated else 3,
+                      20: int(m.guest_elevated), 21: 0, 24: 0, 26: 0}
             if kind not in values:
                 raise RuntimeError(f'GetTokenInformation: class not modeled: {kind}')
             m.put32(a(4), 4)
@@ -1005,11 +1228,23 @@ class Win64Api:
                 m.put32(a(4), 0)
             if a(5):
                 m.put32(a(5), 4)
-            # The guest standard-user token has no requested elevated privileges.
-            m.set_last_error(1300 if count else 0)
+            available = {10, 13, 14, 20} if m.guest_elevated else set()
+            missing = False
+            if a(1):
+                self.enabled_privileges.clear()
+            else:
+                for i in range(count):
+                    luid, attributes = struct.unpack('<QI', m.read(a(2) + 4 + i * 12, 12))
+                    if luid not in available:
+                        missing = True
+                    elif attributes & 2:
+                        self.enabled_privileges.add(luid)
+                    else:
+                        self.enabled_privileges.discard(luid)
+            m.set_last_error(1300 if missing else 0)
             return 1
         if name == 'IsWow64Process2':
-            if a(0) != MASK64:
+            if not self._process(a(0)):
                 return self._error(6)
             m.write(a(1), struct.pack('<H', 0))
             m.write(a(2), struct.pack('<H', 0x8664))
@@ -1017,13 +1252,201 @@ class Win64Api:
         if name in ('CreateFileW', 'CreateFileA', 'ReadFile', 'WriteFile',
                     'FindFirstFileW',
                     'DeleteFileW', 'DeleteFileA', 'GetFileSize', 'GetFileSizeEx',
-                    'SetFilePointer', 'SetFilePointerEx', 'CreateFileMappingW',
-                    'MapViewOfFile', 'UnmapViewOfFile'):
+                    'SetFilePointer', 'SetFilePointerEx'):
             return self._file(name, a)
+        if name in ('CreateFileMappingW', 'CreateFileMappingA', 'OpenFileMappingW', 'OpenFileMappingA',
+                    'MapViewOfFile', 'UnmapViewOfFile'):
+            return self._mapping(name, a)
         if name == 'CloseHandle' and (a(0) in self.file_handles or a(0) in self.mapping_handles):
             return self._file(name, a)
         if name.startswith('Zw'):
             name = 'Nt' + name[2:]
+        if name == 'NtCreateSection':
+            if not self._probe(a(0), 8, writable=True) or not self._probe(a(3), 8):
+                return 0xc0000005
+            if a(2) or a(6):
+                raise RuntimeError('NtCreateSection: only unnamed page-file sections modeled')
+            if a(5) & MASK32 != 0x8000000:
+                raise RuntimeError(f'NtCreateSection: allocation attributes not modeled: {a(5):#x}')
+            protection = a(4) & MASK32
+            if protection not in (2, 4, 0x20, 0x40):
+                return STATUS_INVALID_PAGE_PROTECTION
+            size = m.u64(a(3))
+            if not size:
+                return 0xc0000040  # STATUS_SECTION_TOO_BIG
+            if page_up(size) > m.memory_limit:
+                return STATUS_NO_MEMORY
+            section = {'name': None, 'size': page_up(size), 'protection': protection,
+                       'buffer': ctypes.create_string_buffer(page_up(size))}
+            handle = self.next_handle
+            self.next_handle += 4
+            self.mapping_handles[handle] = (section, a(1) & MASK32)
+            m.put64(a(0), handle)
+            return 0
+        if name == 'NtMapViewOfSection':
+            if not self._process(a(1)) or a(0) not in self.mapping_handles:
+                return STATUS_INVALID_HANDLE
+            if not self._probe(a(2), 8, writable=True) or not self._probe(a(6), 8, writable=True):
+                return 0xc0000005
+            if a(3) or a(8) or a(7) not in (1, 2):
+                raise RuntimeError('NtMapViewOfSection: unsupported ZeroBits, allocation type or inheritance')
+            if a(5) and not self._probe(a(5), 8, writable=True):
+                return 0xc0000005
+            section, access = self.mapping_handles[a(0)]
+            offset = m.u64(a(5)) if a(5) else 0
+            size = m.u64(a(6)) or section['size'] - offset
+            protection = a(9) & MASK32
+            if protection not in PROTECTION:
+                return STATUS_INVALID_PAGE_PROTECTION
+            requested = PROTECTION[protection]
+            if requested & ~PROTECTION[section['protection']]:
+                return 0xc000004e  # STATUS_SECTION_PROTECTION
+            required = (4 if requested & 1 else 0) | (2 if requested & 2 else 0) | (8 if requested & 4 else 0)
+            if required & ~access:
+                return 0xc0000022
+            if offset & 0xffff or size <= 0 or offset + page_up(size) > section['size'] or a(4) > size:
+                return STATUS_INVALID_PARAMETER
+            address = self._map_section(section, offset, size, protection, m.u64(a(2)))
+            if not address:
+                return 0xc0000018
+            m.put64(a(2), address)
+            m.put64(a(6), page_up(size))
+            return 0
+        if name == 'NtUnmapViewOfSection':
+            if not self._process(a(0)):
+                return STATUS_INVALID_HANDLE
+            base = next((base for base, (_, size) in self.file_views.items() if base <= a(1) < base + size), None)
+            if base is not None:
+                m.free(base)
+                del self.file_views[base]
+                return 0
+            module = m.module_for_address(a(1))
+            if module is None or module.system:
+                return 0xc0000019  # STATUS_NOT_MAPPED_VIEW
+            m.uc.ctl_remove_cache(module.base, module.base + module.size)
+            m.uc.mem_unmap(module.base, module.size)
+            m.mapped_bytes -= module.size
+            return 0
+        if name in ('NtOpenKey', 'NtOpenKeyEx'):
+            if not self._probe(a(0), 8, writable=True) or not self._probe(a(2), 48):
+                return 0xc0000005
+            if name.endswith('Ex') and a(3):
+                raise RuntimeError('NtOpenKeyEx: open options not modeled')
+            if m.u64(a(2) + 8):
+                return STATUS_INVALID_HANDLE
+            m.put64(a(0), 0)
+            return 0xc0000034  # Empty isolated registry, matching RegOpenKeyEx.
+        if name == 'NtClose':
+            last_error = m.read(m.teb + 0x68, 4)
+            result = self.dispatch('CloseHandle', a)
+            m.write(m.teb + 0x68, last_error)
+            return 0 if result else STATUS_INVALID_HANDLE
+        if name == 'NtQueryObject':
+            if a(1) & MASK32 != 3:
+                raise RuntimeError(f'NtQueryObject: class not modeled: {a(1):#x}')
+            sections = {id(section) for section, _ in (*self.mapping_handles.values(), *self.file_views.values())}
+            kinds = [
+                ('Process', 1, len(self.process_handles), 0x1fffff),
+                ('Thread', len(m.threads), len(self.thread_handles), 0x1fffff),
+                ('Event', len(self.kernel_events) + len(self.events), len(self.kernel_events) + len(self.events), 0x1f0003),
+                ('Mutant', len({id(v) for v in self.mutex_handles.values()}), len(self.mutex_handles), 0x1f0001),
+                ('File', len(self.file_handles), len(self.file_handles), 0x1f01ff),
+                ('Section', len(sections), len(self.mapping_handles), 0xf001f),
+                ('Token', 1, len(self.token_handles), 0xf01ff),
+            ]
+            required = 8 + sum((0x68 + len(kind.encode('utf-16-le')) + 9) & -8 for kind, *_ in kinds)
+            if a(4):
+                if not self._probe(a(4), 4, writable=True):
+                    return 0xc0000005
+                m.put32(a(4), required)
+            if a(3) < required:
+                return 0xc0000004
+            if not self._probe(a(2), required, writable=True):
+                return 0xc0000005
+            data = bytearray(required)
+            struct.pack_into('<I', data, 0, len(kinds))
+            offset = 8
+            for index, (kind, objects, handles, access) in enumerate(kinds, 2):
+                text = kind.encode('utf-16-le')
+                struct.pack_into('<HH4xQII', data, offset, len(text), len(text) + 2,
+                                 a(2) + offset + 0x68, objects, handles)
+                struct.pack_into('<II', data, offset + 0x28, objects, handles)
+                struct.pack_into('<I', data, offset + 0x50, access)
+                struct.pack_into('<BBBB', data, offset + 0x54, 1, 1, index, 0)
+                data[offset + 0x68:offset + 0x68 + len(text)] = text
+                offset += (0x68 + len(text) + 9) & -8
+            m.write(a(2), bytes(data))
+            return 0
+        if name == 'NtQuerySystemInformation' and a(0) & MASK32 == 5:
+            threads = [(tid, thread) for tid, thread in m.threads.items() if thread['exit'] is None]
+            image = m.target_path.name.encode('utf-16-le')
+            name_offset = 0x100 + 0x50 * len(threads)
+            required = (name_offset + len(image) + 9) & -8
+            if a(3):
+                if not self._probe(a(3), 4, writable=True):
+                    return 0xc0000005
+                m.put32(a(3), required)
+            if a(2) < required:
+                return 0xc0000004
+            if not self._probe(a(1), required, writable=True):
+                return 0xc0000005
+            data = bytearray(required)
+            struct.pack_into('<IIQIIQ', data, 0, 0, len(threads), m.mapped_bytes, 0, len(m.threads), 0)
+            struct.pack_into('<QQQ', data, 0x20, FILETIME_EPOCH, m.time_counter, 0)
+            struct.pack_into('<HH4xQi4xQQ', data, 0x38, len(image), len(image) + 2,
+                             a(1) + name_offset, 8, self._id(), 0)
+            handles = sum(len(getattr(self, field)) for field in ('file_handles', 'mapping_handles',
+                          'thread_handles', 'kernel_events', 'token_handles', 'process_handles',
+                          'mutex_handles', 'snapshots', 'events'))
+            struct.pack_into('<II', data, 0x60, handles, 1)
+            for offset in (0x70, 0x78, 0x88, 0x90, 0xb8, 0xc0, 0xc8):
+                struct.pack_into('<Q', data, offset, m.mapped_bytes)
+            for index, (tid, thread) in enumerate(threads):
+                offset = 0x100 + 0x50 * index
+                state = 2 if tid == m.current_thread else 5 if thread['wait'] or thread['suspended'] else 1
+                struct.pack_into('<QQQI4xQQQiiIII', data, offset, 0,
+                                 m.time_counter if tid == m.current_thread else 0, FILETIME_EPOCH, 0,
+                                 thread['start'], self._id(), tid, 8, 8, 0, state, 5 if thread['suspended'] else 0)
+            data[name_offset:name_offset + len(image)] = image
+            m.write(a(1), bytes(data))
+            return 0
+        if name == 'NtQuerySystemInformation':
+            kind, output, size, returned = a(0) & MASK32, a(1), a(2), a(3)
+            if kind not in (77, 88, 103):
+                raise RuntimeError(f'NtQuerySystemInformation: class not modeled: {kind:#x}')
+            required = {77: 2, 88: 24, 103: 8}[kind]
+            if returned:
+                if not self._probe(returned, 4, writable=True):
+                    return 0xc0000005
+                m.put32(returned, required)
+            if size < required:
+                return 0xc0000004
+            if not self._probe(output, required, writable=True):
+                return 0xc0000005
+            if kind == 77:
+                # No kernel modules execute inside this user-mode CPU guest.
+                m.write(output, b'\0\0')  # RTL_PROCESS_MODULE_INFORMATION_EX terminator
+                return 0
+            if kind == 103:
+                if int.from_bytes(m.read(output, 4), 'little') != required:
+                    return STATUS_INVALID_PARAMETER
+                # Guest policy permits signed kernel images, not test-signed drivers.
+                m.put32(output + 4, 1)
+                return 0
+            pid, length, capacity, buffer = struct.unpack('<QHH4xQ', m.read(output, 24))
+            if length:
+                return STATUS_INVALID_PARAMETER
+            if pid != self._id():
+                return 0xc000000b  # STATUS_INVALID_CID: no such guest process
+            path = ('\\??\\' + str(m.target_path)).encode('utf-16-le')
+            m.write(output + 10, struct.pack('<H', len(path) + 2))
+            if capacity < len(path) + 2:
+                return 0xc0000004
+            if not self._probe(buffer, len(path) + 2, writable=True):
+                return 0xc0000005
+            m.write(buffer, path + b'\0\0')
+            m.write(output + 8, struct.pack('<H', len(path)))
+            return 0
         if name in ('NtOpenFile', 'NtCreateFile'):
             attrs = a(2)
             descriptor = m.u64(attrs + 16)
@@ -1049,14 +1472,12 @@ class Win64Api:
                 return STATUS_INVALID_HANDLE
             if a(1) & MASK32 != 0x11:
                 raise RuntimeError('NtQueryInformationThread: only ThreadHideFromDebugger modeled')
-            if a(4):
-                try:
-                    value = m.read(a(4), 4)
-                    m.write(a(4), value)
-                except UcError:
-                    return 0xc0000005
+            if a(4) and not self._probe(a(4), 4, writable=True):
+                return 0xc0000005
             if a(3) != 1:
                 return 0xc0000004
+            if not self._probe(a(2), 1, writable=True):
+                return 0xc0000005
             m.write(a(2), bytes((int(m.current_thread in self.hidden_threads),)))
             if a(4):
                 m.put32(a(4), 1)
@@ -1073,25 +1494,75 @@ class Win64Api:
             if m.u64(a(3)) != self._id() or m.u64(a(3) + 8):
                 return STATUS_INVALID_PARAMETER
             require_flags(a(1) & MASK32, 0x410, name)
-            m.put64(a(0), MASK64)
+            handle = self.next_handle
+            self.next_handle += 4
+            self.process_handles[handle] = a(1) & MASK32
+            m.put64(a(0), handle)
             return 0
-        if name == 'NtClose' and a(0) == MASK64:
-            return 0
+        if name == 'CloseHandle' and a(0) in self.process_handles:
+            del self.process_handles[a(0)]
+            return 1
         if name == 'NtQueryInformationProcess':
-            if a(0) != MASK64:
-                return STATUS_INVALID_HANDLE
+            if a(4) and not self._probe(a(4), 4, writable=True):
+                return 0xc0000005
+            kind = a(1) & MASK32
+            if kind in (7, 26, 30, 31):
+                size = 4 if kind == 31 else 8
+                if a(3) != size:
+                    return 0xc0000004
+                if not self._process(a(0)):
+                    return STATUS_INVALID_HANDLE
+                if not self._probe(a(2), size, writable=True):
+                    return 0xc0000005
+                value = 1 if kind == 31 else 0
+                m.write(a(2), value.to_bytes(size, 'little'))
+                if a(4):
+                    m.put32(a(4), size)
+                return 0xc0000353 if kind == 30 else 0
             if a(1) & MASK32 != 0:
                 raise RuntimeError('NtQueryInformationProcess: only ProcessBasicInformation modeled')
-            if a(3) < 48:
+            if a(3) != 48:
                 if a(4):
                     m.put32(a(4), 48)
                 return 0xc0000004
+            if not self._process(a(0)):
+                return STATUS_INVALID_HANDLE
+            if not self._probe(a(2), 48, writable=True):
+                return 0xc0000005
             m.write(a(2), struct.pack('<QQQi4xQQ', 0x103, m.peb, 1, 8, self._id(), 0))
             if a(4):
                 m.put32(a(4), 48)
             return 0
         if name in ('NtAllocateVirtualMemory', 'NtProtectVirtualMemory', 'NtFreeVirtualMemory'):
             return self._virtual(name[2:-len('VirtualMemory')], a)
+        if name == 'VirtualQuery':
+            address = a(0) & -PAGE
+            if a(2) < 48:
+                return self._error(24)
+            for lo, hi, permissions in sorted(m.uc.mem_regions()):
+                if lo <= address <= hi:
+                    module = m.module_for_address(address)
+                    allocation = module.base if module else next((base for base, (_, size) in m.allocations.items()
+                                 if base <= address < base + size), lo)
+                    protection = self.protections.get(address, DEFAULT_PROTECTION.get(permissions, 1))
+                    m.write(a(1), struct.pack('<QQI4xQIII4x', address, allocation, 0x20 if module else 4,
+                            hi - address + 1, 0x1000, protection, 0x1000000 if module else 0x20000))
+                    return 48
+                if lo > address:
+                    m.write(a(1), struct.pack('<QQI4xQIII4x', address, 0, 0, lo - address, 0x10000, 1, 0))
+                    return 48
+            return self._error(87)
+        if name in ('VirtualAlloc', 'VirtualFree'):
+            scratch = self._buffer('virtual-args', bytes(16))
+            m.put64(scratch, a(0))
+            m.put64(scratch + 8, a(1))
+            if name == 'VirtualAlloc':
+                values = (MASK64, scratch, 0, scratch + 8, a(2) & MASK32, a(3) & MASK32)
+                status = self._virtual('Allocate', lambda i: values[i])
+                return m.u64(scratch) if not status else self._error(8)
+            values = (MASK64, scratch, scratch + 8, a(2) & MASK32)
+            status = self._virtual('Free', lambda i: values[i])
+            return 1 if not status else self._error(487)
         if name == 'VirtualProtect':
             if not a(3):
                 return self._error(998)
@@ -1140,6 +1611,19 @@ class Win64Api:
             return getattr(self, 'wsa_error', 0)
         if name == 'WSASetLastError':
             self.wsa_error = a(0) & MASK32
+            return 0
+        if name == 'LocalAlloc':
+            require_flags(a(0) & MASK32, 0x40, name)
+            ptr = self._heap_alloc(a(1), bool(a(0) & 0x40))
+            self.heap_owners[ptr] = self._heap()
+            return ptr
+        if name == 'LocalFree':
+            if not a(0):
+                return 0
+            if a(0) not in self.heap_blocks:
+                return self._error(6, a(0))
+            self._heap_free(a(0))
+            self.heap_owners.pop(a(0), None)
             return 0
         if name == 'WSACreateEvent':
             handle = self.next_handle
@@ -1281,14 +1765,30 @@ class Win64Api:
             if kind not in values:
                 raise RuntimeError(f'GetLocaleInfoEx: LCType not modeled: {kind:#x}')
             return self._output(a(2), signed32(a(3)), (values[kind] + '\0').encode('utf-16-le'), 2)
+        if name in ('QueryDosDeviceW', 'QueryDosDeviceA'):
+            wide = name.endswith('W')
+            drives = sorted({'C:', PureWindowsPath(str(m.system_dir)).drive.upper(),
+                             PureWindowsPath(str(m.target_path)).drive.upper()} - {''})
+            devices = {drive: f'\\Device\\HarddiskVolume{index + 1}' for index, drive in enumerate(drives)}
+            if a(0):
+                target = devices.get(m.cstr(a(0), wide=wide).upper())
+                if target is None:
+                    return self._error(2)
+                text = target + '\0\0'
+            else:
+                text = '\0'.join(devices) + '\0\0'
+            if a(2) & MASK32 < len(text):
+                return self._error(122)
+            m.write(a(1), text.encode('utf-16-le' if wide else 'cp1252'))
+            return len(text)
         if name in ('GetTempPathA', 'GetTempPathW'):
             text = 'C:\\Temp\\'
             if (a(0) & MASK32) <= len(text):
                 return len(text) + 1
             m.write(a(1), (text + '\0').encode('utf-16-le' if name.endswith('W') else 'cp1252'))
             return len(text)
-        if name in ('GetSystemDirectoryW', 'GetSystemDirectoryA'):
-            text = str(m.system_dir)
+        if name in ('GetSystemDirectoryW', 'GetSystemDirectoryA', 'GetWindowsDirectoryW', 'GetWindowsDirectoryA'):
+            text = str(m.system_dir.parent if name.startswith('GetWindows') else m.system_dir)
             if (a(1) & MASK32) <= len(text):
                 return len(text) + 1
             m.write(a(0), (text + '\0').encode('utf-16-le' if name.endswith('W') else 'cp1252'))
@@ -1322,9 +1822,6 @@ class Win64Api:
         if name in ('RegOpenKeyExW', 'RegOpenKeyExA', 'RegOpenKeyW', 'RegOpenKeyA'):
             # This isolated guest has an empty registry; never inspect host keys.
             return 2  # ERROR_FILE_NOT_FOUND
-        if name == 'OpenFileMappingW':
-            # No externally created shared objects exist in this isolated guest.
-            return self._error(2)
         if name == 'AreFileApisANSI':
             return 1
         if name in ('TlsAlloc', 'TlsGetValue', 'TlsSetValue', 'TlsFree', 'FlsAlloc', 'FlsGetValue', 'FlsSetValue', 'FlsFree'):
@@ -1343,10 +1840,14 @@ class Win64Api:
             return self._srw(short, a(0))
         if short in ('EncodePointer', 'DecodePointer'):
             return a(0) ^ 0xc5ac136ea83c57d1
+        if name == 'GetConsoleWindow':
+            return 0  # The isolated guest exposes console streams, not a desktop window.
         if name == 'GetStdHandle':
             k = signed32(a(0))
             return self.console[k] if k in self.console else self._error(6, MASK64)
         if name == 'GetFileType':
+            if a(0) in self.file_handles:
+                return 1  # FILE_TYPE_DISK, including approved PE files and guest temp files.
             return 2 if a(0) in self.console.values() else self._error(6)
         if name == 'GetConsoleMode':
             if a(0) not in self.console.values():
